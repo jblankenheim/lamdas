@@ -1,0 +1,185 @@
+///requires permission to read/update dynamodb and access to kms
+//kms needs to have key policy as well
+const AWS = require('aws-sdk');
+const crypto = require('crypto');
+const cognito = new AWS.CognitoIdentityServiceProvider();
+const ses = new AWS.SES();
+const kms = new AWS.KMS();
+
+const userPoolId = 'us-east-2_1StncHhup'; 
+const groupName = 'managers';
+const encryptionKeyArn = "arn:aws:kms:us-east-2:311064037995:key/819a56d4-f8cb-4a80-86ca-16c41e70f4c8";
+const keyArn = encryptionKeyArn;
+
+const getKeyFromKMS = async (keyArn) => {
+    try {
+        const keyData = await kms.describeKey({ KeyId: keyArn }).promise();
+        console.log('Key data:', keyData); 
+        return keyData.KeyMetadata.Arn;
+    } catch (error) {
+        console.error('Error retrieving key from KMS:', error);
+        throw error;
+    }
+}
+
+const encryptData = async (data, keyArn) => {
+    try {
+        const key = await getKeyFromKMS(keyArn);
+        const encryptedData = await kms.encrypt({
+            KeyId: keyArn,
+            Plaintext: Buffer.from(data, 'utf8')
+        }).promise();
+        return encryptedData.CiphertextBlob.toString('base64');
+    } catch (error) {
+        console.error('Error encrypting data:', error);
+        throw error;
+    }
+}
+
+const sendEmail = (recipientEmail, message) => {
+    const params = {
+        Destination: {
+            ToAddresses: [recipientEmail]
+        },
+        Message: {
+            Body: {
+                Html: {
+                    Charset: 'UTF-8',
+                    Data: message
+                }
+            },
+            Subject: {
+                Charset: 'UTF-8',
+                Data: 'New Work Order Created'
+            }
+        },
+        Source: 'jason.e.blankenheim@gmail.com'
+    };
+
+    return ses.sendEmail(params).promise();
+};
+
+exports.handler = async (event) => {
+    try {
+        console.log('Received event:', JSON.stringify(event, null, 2));
+
+        if (!event.Records || event.Records.length === 0) {
+            throw new Error('Event does not contain any records');
+        }
+
+        for (const record of event.Records) {
+            if (record.eventSource !== 'aws:dynamodb') {
+                console.log('Event source is not DynamoDB');
+                continue;
+            }
+
+            if (record.eventName !== 'INSERT') {
+                console.log('Event is not an INSERT event');
+                continue;
+            }
+
+            if (!record.dynamodb || !record.dynamodb.NewImage) {
+                console.log('DynamoDB NewImage is undefined');
+                continue;
+            }
+
+            const newImage = record.dynamodb.NewImage;
+            console.log('NewImage:', JSON.stringify(newImage, null, 2));
+
+            const id = newImage.id ? newImage.id.S : null;
+            const openDate = newImage.openDate.S;
+            const equipmentName = newImage.equipmentName.S;
+            const locationName = newImage.equipmentLocation.S;
+            const description = newImage.description.S;
+            const notes = newImage.notes && newImage.notes.S ? newImage.notes.S : "No additional notes";
+
+            const message = `A new work order ${id} was created on ${openDate} for ${equipmentName} at the ${locationName} location. The description is: ${description}. Additional notes: ${notes}`;
+
+            let users = [];
+            let params = {
+                UserPoolId: userPoolId,
+                GroupName: groupName,
+                Limit: 60 
+            };
+
+            do {
+                const response = await cognito.listUsersInGroup(params).promise();
+                users = users.concat(response.Users);
+                params.NextToken = response.NextToken;
+            } while (params.NextToken);
+
+            const emailPromises = users.map(async (user) => {
+                const emailAttribute = user.Attributes.find(attr => attr.Name === 'email');
+                const familyNameAttribute = user.Attributes.find(attr => attr.Name === 'family_name');
+                const givenNameAttribute = user.Attributes.find(attr => attr.Name === 'given_name');
+                const profileAttribute = user.Attributes.find(attr => attr.Name === 'profile');
+
+                const recipientEmail = emailAttribute ? emailAttribute.Value : null;
+                const familyName = familyNameAttribute ? familyNameAttribute.Value : '';
+                const givenName = givenNameAttribute ? givenNameAttribute.Value : '';
+                const profile = profileAttribute ? profileAttribute.Value : '';
+
+                if (!recipientEmail || !familyName || !givenName || !profile) {
+                    console.log('Missing required user attributes:', { recipientEmail, familyName, givenName, profile });
+                    return Promise.resolve();
+                }
+
+                const baseURL = `https://9yjz63s4ye.execute-api.us-east-2.amazonaws.com/staging/workOrder?`;
+
+                const constructQueryString = (data) => {
+                    return `workOrderId=${encodeURIComponent(data.workOrderId)}&employeeName=${encodeURIComponent(data.employeeName)}&profile=${encodeURIComponent(data.profile)}&response=${encodeURIComponent(data.response)}`;
+                };
+
+                const data = {
+                    workOrderId: `${id}`,
+                    employeeName: `${givenName} ${familyName}`,
+                    profile: `${profile}`
+                };
+
+                const acceptData = { ...data, response: true };
+                const rejectData = { ...data, response: false };
+
+                const acceptQueryString = constructQueryString(acceptData);
+                const rejectQueryString = constructQueryString(rejectData);
+
+                const acceptURL = `${baseURL}${acceptQueryString}`;
+                const rejectURL = `${baseURL}${rejectQueryString}`;
+
+                const acceptForm = `
+                <div style="display: inline-block; margin-right: 10px;">
+                    <a href="${acceptURL}" 
+                       style="display: inline-block; padding: 10px 20px; background-color: green; color: white; text-decoration: none; border-radius: 5px;">
+                       Accept
+                    </a>
+                </div>
+                `;
+
+                const rejectForm = `
+                <div style="display: inline-block;">
+                    <a href="${rejectURL}" 
+                       style="display: inline-block; padding: 10px 20px; background-color: red; color: white; text-decoration: none; border-radius: 5px;">
+                       Reject
+                    </a>
+                </div>
+                `;
+
+                const emailMessage = `${message}<br><br>Actions:<br><div style="text-align: center;">${acceptForm} ${rejectForm}</div>`;
+                return sendEmail(recipientEmail, emailMessage);
+            });
+
+            await Promise.all(emailPromises);
+        }
+    } catch (error) {
+        console.error("Error processing request", error);
+        return {
+            statusCode: 500,
+            body: JSON.stringify({
+                message: 'Error processing request.',
+                error: error.message
+            }),
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        };
+    }
+};
